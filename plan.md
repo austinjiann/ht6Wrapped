@@ -38,17 +38,20 @@ Frontend (Next.js :3000)          Backend (Hono :3001)           External
 
 ### Endpoints Used
 
-| Purpose | Endpoint | Notes |
-|---------|----------|-------|
-| List commits in window | `GET /repos/{owner}/{repo}/commits?since=&until=&per_page=100` | Paginate via `Link` header. Returns commit metadata + timestamps. |
-| Get commit stats | `GET /repos/{owner}/{repo}/commits/{sha}` | Returns `stats.additions`, `stats.deletions`. **One call per commit.** |
-| Get language breakdown | `GET /repos/{owner}/{repo}/languages` | Returns `{ "TypeScript": 45000, "CSS": 12000, ... }` (bytes). Single call, no pagination. |
+| Purpose | Endpoint | Cost | Notes |
+|---------|----------|------|-------|
+| List commits in window | `GET /repos/{owner}/{repo}/commits?since=&until=&per_page=100` | ~1–3 calls | Paginate via `Link` header. Returns timestamps + author info. |
+| Lines added/deleted | `GET /repos/{owner}/{repo}/stats/code_frequency` | 1 call | Weekly `[timestamp, additions, deletions]` arrays. **Replaces per-commit fetches.** |
+| Repo metadata | `GET /repos/{owner}/{repo}` | 1 call | `size`, `stargazers_count`, `created_at`, etc. |
+| Language breakdown | `GET /repos/{owner}/{repo}/languages` | 1 call | Returns `{ "TypeScript": 45000, ... }` (bytes). |
+
+**Total: ~4–6 API calls per repo** (vs. 50–300+ with per-commit fetches).
 
 ### Rate Limits
 
 - **Authenticated:** 5,000 requests/hour (using a server-side `GITHUB_TOKEN`)
 - The `List commits` endpoint returns max **100 per page**
-- Getting per-commit stats requires **1 API call per commit** (N+1 pattern)
+- At ~5 calls/repo, can process **~1,000 repos/hour** comfortably
 
 ### Pagination Strategy
 
@@ -57,15 +60,15 @@ For `GET /repos/{owner}/{repo}/commits`:
 1. Set `per_page=100`, `since` and `until` to the time window bounds
 2. Parse the `Link` response header for `rel="next"`
 3. Loop until no `next` link remains
-4. Collect all commit SHAs + timestamps from the list response
+4. Collect all commit timestamps + author info from the list response
 
-### Handling the N+1 Problem (Commit Stats)
+### Stats API: `code_frequency` (replaces per-commit fetches)
 
-Getting `lines_added` / `lines_deleted` requires fetching each commit individually. Strategy:
+`GET /repos/{owner}/{repo}/stats/code_frequency` returns weekly `[unix_timestamp, additions, deletions]` arrays for the entire repo history. For hackathon repos (created during the event), this covers the full project.
 
-- After listing all commits, batch-fetch individual commits using `Promise.all` with a **concurrency limiter** (e.g., 10 concurrent requests)
-- For a 72-hour hackathon window, expect ~50–300 commits — well within rate limits
-- Sum `stats.additions` and `stats.deletions` across all fetched commits
+- **Returns `202 Accepted`** if GitHub hasn't computed stats yet — retry after 1–2 seconds (up to 3 retries)
+- Sum all weeks' additions/deletions for totals
+- Single call replaces the entire N+1 pattern
 
 ### Parsing `owner/repo` from URL
 
@@ -119,6 +122,12 @@ Accept: application/vnd.github+json
 | `lines_deleted` | `integer` | NOT NULL, default 0 |
 | `languages_bytes` | `jsonb` | `{ "TypeScript": 45000, ... }` |
 | `languages_share` | `jsonb` | `{ "TypeScript": 0.78, ... }` (percentages) |
+| `repo_size_kb` | `integer` | NOT NULL, default 0 |
+| `night_owl_score` | `real` | 0.0–1.0, % of commits between 12am–6am EST |
+| `early_bird_score` | `real` | 0.0–1.0, % of commits between 6am–10am EST |
+| `commit_percentile` | `real` | 0.0–1.0, computed vs other wrapped results |
+| `language_percentiles` | `jsonb` | `{ "TypeScript": 0.85, ... }` per-language percentile vs others |
+| `size_percentile` | `real` | 0.0–1.0, repo size vs other wrapped results |
 | `created_at` | `timestamptz` | default `now()` |
 
 ### SQL Migration
@@ -148,6 +157,12 @@ create table wrapped_stats (
   lines_deleted integer not null default 0,
   languages_bytes jsonb not null default '{}',
   languages_share jsonb not null default '{}',
+  repo_size_kb integer not null default 0,
+  night_owl_score real,
+  early_bird_score real,
+  commit_percentile real,
+  language_percentiles jsonb not null default '{}',
+  size_percentile real,
   created_at timestamptz default now()
 );
 
@@ -212,12 +227,15 @@ Flow:
 2. Look up project → get `repo_url`
 3. Parse owner/repo from URL
 4. Compute `window_end = now()`, `window_start = now() - windowHours`
-5. Fetch commits from GitHub (paginated list)
-6. Fetch individual commit stats (concurrent, limited to 10 at a time)
-7. Fetch languages
-8. Compute analytics (histogram, peak hour, etc.)
-9. Insert row into `wrapped_stats`
-10. Return shareId + stats
+5. Fetch in parallel (3 concurrent requests):
+   - `listCommits(owner, repo, since, until)` — paginated
+   - `getCodeFrequency(owner, repo)` — 1 call, replaces per-commit fetches
+   - `getLanguages(owner, repo)` — 1 call
+   - `getRepoMeta(owner, repo)` — 1 call
+6. Compute analytics (histogram, peak hour, night owl, early bird, etc.)
+7. Insert row into `wrapped_stats`
+8. Compute percentiles vs all other wrapped_stats rows → UPDATE row
+9. Return shareId + stats (including percentiles)
 
 #### `GET /wrapped/:shareId`
 
@@ -236,7 +254,13 @@ Response 200:
     "linesAdded": 4521,
     "linesDeleted": 1230,
     "languagesBytes": { "TypeScript": 45000, "CSS": 12000 },
-    "languagesShare": { "TypeScript": 0.78, "CSS": 0.22 }
+    "languagesShare": { "TypeScript": 0.78, "CSS": 0.22 },
+    "repoSizeKb": 2340,
+    "nightOwlScore": 0.35,
+    "earlyBirdScore": 0.08,
+    "commitPercentile": 0.85,
+    "languagePercentiles": { "TypeScript": 0.90, "CSS": 0.45 },
+    "sizePercentile": 0.72
   }
 }
 ```
@@ -260,29 +284,31 @@ Protected by a simple shared secret in `Authorization` header (`Bearer <ADMIN_SE
 #### `github.ts`
 
 ```ts
-// Core functions:
+// Core functions — all 1 call each (except listCommits which paginates):
 
 async function listCommits(owner, repo, since, until): Promise<CommitListItem[]>
 // Paginates through GET /repos/{owner}/{repo}/commits
-// Returns: sha, commit.author.date, commit.message
+// Returns: sha, commit.author.date, commit.author.name/email
 
-async function getCommitStats(owner, repo, sha): Promise<{ additions: number; deletions: number }>
-// Fetches GET /repos/{owner}/{repo}/commits/{sha}
-// Returns: stats.additions, stats.deletions
+async function getCodeFrequency(owner, repo): Promise<{ additions: number; deletions: number }>
+// Fetches GET /repos/{owner}/{repo}/stats/code_frequency
+// Returns weekly [timestamp, additions, deletions] arrays
+// Sums all weeks → { additions, deletions }
+// Retries on 202 (up to 3 times with 2s delay)
+
+async function getRepoMeta(owner, repo): Promise<{ sizeKb: number; stars: number }>
+// Fetches GET /repos/{owner}/{repo}
+// Returns: size (KB), stargazers_count
 
 async function getLanguages(owner, repo): Promise<Record<string, number>>
 // Fetches GET /repos/{owner}/{repo}/languages
 // Returns: { "TypeScript": 45000, ... }
-
-async function fetchAllCommitStats(owner, repo, shas: string[]): Promise<{ totalAdded: number; totalDeleted: number }>
-// Calls getCommitStats for each SHA with concurrency limit of 10
-// Sums additions/deletions
 ```
 
 #### `analytics.ts`
 
 ```ts
-function computeStats(commits: CommitListItem[], commitStats, languages, windowStart, windowEnd): WrappedStats
+function computeStats(commits, codeFreq, languages, repoMeta, windowStart, windowEnd): WrappedStats
 // 1. Total commits = commits.length
 // 2. First commit = min(commit.author.date)
 // 3. Convert each timestamp to America/Toronto timezone
@@ -290,14 +316,48 @@ function computeStats(commits: CommitListItem[], commitStats, languages, windowS
 // 5. Peak hour = index of max value in histogram
 // 6. Hours without commits = count of zero-valued buckets within the window
 //    (only count hours that fall within window_start..window_end)
-// 7. Lines added/deleted from commitStats
+// 7. Lines added/deleted from codeFrequency totals
 // 8. Language share = each language's bytes / total bytes
+// 9. Night owl score = commits between 0:00–5:59 EST / total commits
+// 10. Early bird score = commits between 6:00–9:59 EST / total commits
+// 11. Repo size from repoMeta
+
+async function computePercentiles(shareId): Promise<Percentiles>
+// Runs AFTER the row is inserted into wrapped_stats.
+// Queries all wrapped_stats rows to compute this result's rank:
+//
+// Commit percentile:
+//   COUNT(rows WHERE total_commits < this.total_commits) / total rows
+//   → "more commits than 85% of teams"
+//
+// Size percentile:
+//   COUNT(rows WHERE repo_size_kb < this.repo_size_kb) / total rows
+//   → "bigger codebase than 72% of teams"
+//
+// Language percentiles (per language):
+//   For each language in this result's languages_share:
+//     COUNT(rows WHERE languages_share->>lang < this share) / total rows
+//   → "top 15% TypeScript usage"
+//
+// Updates the row with computed percentiles.
 ```
 
 **Hours without commits calculation:**
 - Generate all hour-slots between `window_start` and `window_end` (in EST)
 - Count how many of those slots have zero commits in the histogram
 - This is bounded by the window, not a fixed 24 hours
+
+**Night owl / Early bird definitions:**
+- Night owl: commits where EST hour is in `[0, 1, 2, 3, 4, 5]`
+- Early bird: commits where EST hour is in `[6, 7, 8, 9]`
+- Both scores are `0.0–1.0` (fraction of total commits in that window)
+- If 0 commits, both scores are `0`
+
+**Percentile computation:**
+- Uses all existing `wrapped_stats` rows as the comparison pool
+- Percentile = `(# of rows with a lower value) / (total rows)` → value between 0.0 and 1.0
+- Computed after insert, then UPDATE the same row
+- Percentiles are a **snapshot** — they reflect standings at generation time, not live
 
 ### Environment Variables
 
@@ -370,7 +430,19 @@ interface Project {
 interface CommitListItem {
   sha: string;
   authorDate: string;   // ISO 8601
+  authorName: string;
+  authorEmail: string;
   message: string;
+}
+
+interface CodeFrequencyResult {
+  additions: number;
+  deletions: number;
+}
+
+interface RepoMeta {
+  sizeKb: number;
+  stars: number;
 }
 
 interface WrappedStats {
@@ -383,6 +455,12 @@ interface WrappedStats {
   linesDeleted: number;
   languagesBytes: Record<string, number>;
   languagesShare: Record<string, number>;
+  repoSizeKb: number;
+  nightOwlScore: number;            // 0.0–1.0
+  earlyBirdScore: number;           // 0.0–1.0
+  commitPercentile: number;         // 0.0–1.0
+  languagePercentiles: Record<string, number>;  // per-language 0.0–1.0
+  sizePercentile: number;           // 0.0–1.0
 }
 
 interface WrappedResult {
@@ -414,8 +492,8 @@ interface CreateWrappedRequest {
 
 5. **GitHub client** — `services/github.ts`
    - `listCommits()` with pagination (follow `Link` header)
-   - `getCommitStats()` for single commit
-   - `fetchAllCommitStats()` with concurrency limiter
+   - `getCodeFrequency()` with 202 retry logic
+   - `getRepoMeta()` for size/stars
    - `getLanguages()`
 6. **Test manually** — hit a real repo to verify data shape
 
@@ -425,7 +503,10 @@ interface CreateWrappedRequest {
    - Timestamp conversion to `America/Toronto`
    - Histogram computation
    - Peak hour, hours without commits
+   - Night owl score (commits 12am–6am EST / total)
+   - Early bird score (commits 6am–10am EST / total)
    - Language share calculation
+   - `computePercentiles()` — query all wrapped_stats, rank current result
 8. **Projects routes** — `routes/projects.ts`
    - `GET /projects` (list all)
    - `POST /admin/projects` (seed new ones, auth-protected)
